@@ -165,6 +165,8 @@
 (define-constant ERR-NO-REFINANCE (err u109))
 (define-constant ERR-ALREADY-APPROVED (err u110))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u111))
+(define-constant ERR-CONTRACT-EXPIRED (err u112))
+(define-constant ERR-NOTIFICATION-EXISTS (err u113))
 
 (define-map milestone-disputes
     { contract-id: uint, milestone-id: uint }
@@ -366,4 +368,102 @@
 
 (define-read-only (get-refinance-request (contract-id uint) (milestone-id uint))
     (ok (map-get? milestone-refinance-requests { contract-id: contract-id, milestone-id: milestone-id }))
+)
+
+(define-map contract-expiry-notifications
+    uint
+    {
+        notification-blocks-before: uint,
+        notification-sent: bool,
+        last-checked: uint
+    }
+)
+
+(define-public (set-expiry-notification
+    (contract-id uint)
+    (blocks-before-expiry uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (existing-notification (map-get? contract-expiry-notifications contract-id))
+    )
+        (asserts! (or (is-eq tx-sender (get party-a contract)) (is-eq tx-sender (get party-b contract))) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none existing-notification) ERR-NOTIFICATION-EXISTS)
+        (map-set contract-expiry-notifications contract-id
+            {
+                notification-blocks-before: blocks-before-expiry,
+                notification-sent: false,
+                last-checked: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (check-contract-expiry (contract-id uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (current-height stacks-block-height)
+        (end-date (get end-date contract))
+        (current-status (get status contract))
+    )
+        (if (and (>= current-height end-date) (is-eq current-status "ACTIVE"))
+            (begin
+                (map-set legal-contracts contract-id
+                    (merge contract { status: "EXPIRED" })
+                )
+                (ok "EXPIRED")
+            )
+            (if (is-eq current-status "ACTIVE")
+                (ok "ACTIVE")
+                (ok current-status)
+            )
+        )
+    )
+)
+
+(define-public (update-notification-status (contract-id uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (notification (map-get? contract-expiry-notifications contract-id))
+        (current-height stacks-block-height)
+        (end-date (get end-date contract))
+    )
+        (match notification
+            notif
+            (let (
+                (notification-threshold (- end-date (get notification-blocks-before notif)))
+                (should-notify (and (>= current-height notification-threshold) (not (get notification-sent notif))))
+            )
+                (if should-notify
+                    (begin
+                        (map-set contract-expiry-notifications contract-id
+                            (merge notif { notification-sent: true, last-checked: current-height })
+                        )
+                        (ok true)
+                    )
+                    (begin
+                        (map-set contract-expiry-notifications contract-id
+                            (merge notif { last-checked: current-height })
+                        )
+                        (ok false)
+                    )
+                )
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-read-only (get-expiry-notification (contract-id uint))
+    (ok (map-get? contract-expiry-notifications contract-id))
+)
+
+(define-read-only (is-contract-expired (contract-id uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (current-height stacks-block-height)
+        (end-date (get end-date contract))
+    )
+        (ok (>= current-height end-date))
+    )
 )
