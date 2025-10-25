@@ -167,6 +167,9 @@
 (define-constant ERR-INSUFFICIENT-FUNDS (err u111))
 (define-constant ERR-CONTRACT-EXPIRED (err u112))
 (define-constant ERR-NOTIFICATION-EXISTS (err u113))
+(define-constant ERR-AMENDMENT-EXISTS (err u114))
+(define-constant ERR-NO-AMENDMENT (err u115))
+(define-constant ERR-AMENDMENT-EXECUTED (err u116))
 
 (define-map milestone-disputes
     { contract-id: uint, milestone-id: uint }
@@ -466,4 +469,149 @@
     )
         (ok (>= current-height end-date))
     )
+)
+
+(define-map contract-amendments
+    uint
+    {
+        proposer: principal,
+        new-party-a: (optional principal),
+        new-party-b: (optional principal),
+        new-start-date: (optional uint),
+        new-end-date: (optional uint),
+        new-value: (optional uint),
+        reason: (string-ascii 200),
+        party-a-approved: bool,
+        party-b-approved: bool,
+        creator-approved: bool,
+        status: (string-ascii 20),
+        created-at: uint
+    }
+)
+
+(define-public (propose-contract-amendment
+    (contract-id uint)
+    (new-party-a (optional principal))
+    (new-party-b (optional principal))
+    (new-start-date (optional uint))
+    (new-end-date (optional uint))
+    (new-value (optional uint))
+    (reason (string-ascii 200)))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (existing-amendment (map-get? contract-amendments contract-id))
+    )
+        (asserts! (or 
+            (is-eq tx-sender (get party-a contract)) 
+            (is-eq tx-sender (get party-b contract))
+            (is-eq tx-sender (get creator contract))
+        ) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none existing-amendment) ERR-AMENDMENT-EXISTS)
+        (map-set contract-amendments contract-id
+            {
+                proposer: tx-sender,
+                new-party-a: new-party-a,
+                new-party-b: new-party-b,
+                new-start-date: new-start-date,
+                new-end-date: new-end-date,
+                new-value: new-value,
+                reason: reason,
+                party-a-approved: (is-eq tx-sender (get party-a contract)),
+                party-b-approved: (is-eq tx-sender (get party-b contract)),
+                creator-approved: (is-eq tx-sender (get creator contract)),
+                status: "PENDING",
+                created-at: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-contract-amendment (contract-id uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (amendment (unwrap! (map-get? contract-amendments contract-id) ERR-NO-AMENDMENT))
+        (is-party-a (is-eq tx-sender (get party-a contract)))
+        (is-party-b (is-eq tx-sender (get party-b contract)))
+        (is-creator (is-eq tx-sender (get creator contract)))
+    )
+        (asserts! (or is-party-a is-party-b is-creator) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status amendment) "PENDING") ERR-AMENDMENT-EXECUTED)
+        (let ((updated-amendment (merge amendment {
+            party-a-approved: (or (get party-a-approved amendment) is-party-a),
+            party-b-approved: (or (get party-b-approved amendment) is-party-b),
+            creator-approved: (or (get creator-approved amendment) is-creator)
+        })))
+            (map-set contract-amendments contract-id updated-amendment)
+            (if (and 
+                (get party-a-approved updated-amendment)
+                (get party-b-approved updated-amendment)
+                (get creator-approved updated-amendment)
+            )
+                (begin
+                    (try! (execute-contract-amendment contract-id))
+                    (ok true)
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (execute-contract-amendment (contract-id uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (amendment (unwrap! (map-get? contract-amendments contract-id) ERR-NO-AMENDMENT))
+        (current-value (get value contract))
+        (new-value-opt (get new-value amendment))
+    )
+        (match new-value-opt
+            new-val
+            (if (> new-val current-value)
+                (try! (stx-transfer? (- new-val current-value) (get party-a contract) (as-contract tx-sender)))
+                (if (> current-value new-val)
+                    (try! (stx-transfer? (- current-value new-val) (as-contract tx-sender) (get party-a contract)))
+                    true
+                )
+            )
+            true
+        )
+        (let (
+            (updated-contract (merge contract {
+                party-a: (default-to (get party-a contract) (get new-party-a amendment)),
+                party-b: (default-to (get party-b contract) (get new-party-b amendment)),
+                start-date: (default-to (get start-date contract) (get new-start-date amendment)),
+                end-date: (default-to (get end-date contract) (get new-end-date amendment)),
+                value: (default-to (get value contract) (get new-value amendment))
+            }))
+        )
+            (map-set legal-contracts contract-id updated-contract)
+            (map-set contract-amendments contract-id
+                (merge amendment { status: "EXECUTED" })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (reject-contract-amendment (contract-id uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (amendment (unwrap! (map-get? contract-amendments contract-id) ERR-NO-AMENDMENT))
+    )
+        (asserts! (or 
+            (is-eq tx-sender (get party-a contract)) 
+            (is-eq tx-sender (get party-b contract))
+            (is-eq tx-sender (get creator contract))
+        ) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status amendment) "PENDING") ERR-AMENDMENT-EXECUTED)
+        (map-set contract-amendments contract-id
+            (merge amendment { status: "REJECTED" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-contract-amendment (contract-id uint))
+    (ok (map-get? contract-amendments contract-id))
 )
