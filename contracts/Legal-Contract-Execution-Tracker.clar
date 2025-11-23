@@ -170,6 +170,9 @@
 (define-constant ERR-AMENDMENT-EXISTS (err u114))
 (define-constant ERR-NO-AMENDMENT (err u115))
 (define-constant ERR-AMENDMENT-EXECUTED (err u116))
+(define-constant ERR-INVALID-PERCENTAGE (err u117))
+(define-constant ERR-PAYMENT-RELEASED (err u118))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u119))
 
 (define-map milestone-disputes
     { contract-id: uint, milestone-id: uint }
@@ -614,4 +617,178 @@
 
 (define-read-only (get-contract-amendment (contract-id uint))
     (ok (map-get? contract-amendments contract-id))
+)
+
+(define-map milestone-payment-schedules
+    { contract-id: uint, milestone-id: uint, payment-stage: uint }
+    {
+        percentage: uint,
+        released: bool,
+        released-at: (optional uint),
+        released-to: (optional principal),
+        amount: uint
+    }
+)
+
+(define-map milestone-payment-stage-counters
+    { contract-id: uint, milestone-id: uint }
+    uint
+)
+
+(define-private (store-payment-stage
+    (stage-data { contract-id: uint, milestone-id: uint, milestone-value: uint, percentage: uint, stage-num: uint })
+    (accumulated uint))
+    (let (
+        (amount (/ (* (get milestone-value stage-data) (get percentage stage-data)) u100))
+    )
+        (map-set milestone-payment-schedules
+            { contract-id: (get contract-id stage-data), milestone-id: (get milestone-id stage-data), payment-stage: (get stage-num stage-data) }
+            {
+                percentage: (get percentage stage-data),
+                released: false,
+                released-at: none,
+                released-to: none,
+                amount: amount
+            }
+        )
+        (+ accumulated u1)
+    )
+)
+
+(define-public (configure-milestone-payment-schedule
+    (contract-id uint)
+    (milestone-id uint)
+    (percentages (list 10 uint)))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (milestone (unwrap! (map-get? contract-milestones { contract-id: contract-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+        (total-percentage (fold + percentages u0))
+        (milestone-value (get value milestone))
+        (stage-count (len percentages))
+    )
+        (asserts! (is-eq tx-sender (get creator contract)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq total-percentage u100) ERR-INVALID-PERCENTAGE)
+        (asserts! (not (get completed milestone)) ERR-ALREADY-COMPLETED)
+        (map-set milestone-payment-stage-counters
+            { contract-id: contract-id, milestone-id: milestone-id }
+            stage-count
+        )
+        (asserts! (> stage-count u0) ERR-INVALID-PERCENTAGE)
+        (if (>= stage-count u1)
+            (begin
+                (map-set milestone-payment-schedules
+                    { contract-id: contract-id, milestone-id: milestone-id, payment-stage: u1 }
+                    {
+                        percentage: (default-to u0 (element-at percentages u0)),
+                        released: false,
+                        released-at: none,
+                        released-to: none,
+                        amount: (/ (* milestone-value (default-to u0 (element-at percentages u0))) u100)
+                    }
+                )
+                (if (>= stage-count u2)
+                    (begin
+                        (map-set milestone-payment-schedules
+                            { contract-id: contract-id, milestone-id: milestone-id, payment-stage: u2 }
+                            {
+                                percentage: (default-to u0 (element-at percentages u1)),
+                                released: false,
+                                released-at: none,
+                                released-to: none,
+                                amount: (/ (* milestone-value (default-to u0 (element-at percentages u1))) u100)
+                            }
+                        )
+                        (if (>= stage-count u3)
+                            (begin
+                                (map-set milestone-payment-schedules
+                                    { contract-id: contract-id, milestone-id: milestone-id, payment-stage: u3 }
+                                    {
+                                        percentage: (default-to u0 (element-at percentages u2)),
+                                        released: false,
+                                        released-at: none,
+                                        released-to: none,
+                                        amount: (/ (* milestone-value (default-to u0 (element-at percentages u2))) u100)
+                                    }
+                                )
+                                (if (>= stage-count u4)
+                                    (begin
+                                        (map-set milestone-payment-schedules
+                                            { contract-id: contract-id, milestone-id: milestone-id, payment-stage: u4 }
+                                            {
+                                                percentage: (default-to u0 (element-at percentages u3)),
+                                                released: false,
+                                                released-at: none,
+                                                released-to: none,
+                                                amount: (/ (* milestone-value (default-to u0 (element-at percentages u3))) u100)
+                                            }
+                                        )
+                                        (if (>= stage-count u5)
+                                            (map-set milestone-payment-schedules
+                                                { contract-id: contract-id, milestone-id: milestone-id, payment-stage: u5 }
+                                                {
+                                                    percentage: (default-to u0 (element-at percentages u4)),
+                                                    released: false,
+                                                    released-at: none,
+                                                    released-to: none,
+                                                    amount: (/ (* milestone-value (default-to u0 (element-at percentages u4))) u100)
+                                                }
+                                            )
+                                            true
+                                        )
+                                    )
+                                    true
+                                )
+                            )
+                            true
+                        )
+                    )
+                    true
+                )
+            )
+            true
+        )
+        (ok true)
+    )
+)
+
+(define-public (release-payment-stage
+    (contract-id uint)
+    (milestone-id uint)
+    (payment-stage uint))
+    (let (
+        (contract (unwrap! (map-get? legal-contracts contract-id) ERR-NOT-FOUND))
+        (milestone (unwrap! (map-get? contract-milestones { contract-id: contract-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+        (payment (unwrap! (map-get? milestone-payment-schedules { contract-id: contract-id, milestone-id: milestone-id, payment-stage: payment-stage }) ERR-NOT-FOUND))
+        (recipient (get party-b contract))
+    )
+        (asserts! (or (is-eq tx-sender (get creator contract)) (is-eq tx-sender (get party-a contract))) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get released payment)) ERR-PAYMENT-RELEASED)
+        (try! (as-contract (stx-transfer? (get amount payment) tx-sender recipient)))
+        (map-set milestone-payment-schedules
+            { contract-id: contract-id, milestone-id: milestone-id, payment-stage: payment-stage }
+            (merge payment { 
+                released: true, 
+                released-at: (some stacks-block-height),
+                released-to: (some recipient)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-payment-stage
+    (contract-id uint)
+    (milestone-id uint)
+    (payment-stage uint))
+    (ok (map-get? milestone-payment-schedules { contract-id: contract-id, milestone-id: milestone-id, payment-stage: payment-stage }))
+)
+
+(define-read-only (get-milestone-payment-status
+    (contract-id uint)
+    (milestone-id uint))
+    (let (
+        (stage-count (default-to u0 (map-get? milestone-payment-stage-counters { contract-id: contract-id, milestone-id: milestone-id })))
+    )
+        (ok { total-stages: stage-count })
+    )
 )
